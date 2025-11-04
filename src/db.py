@@ -50,6 +50,13 @@ class PodDatabase:
         )
         self.connection.commit()
 
+    def get_finished_pods(self):
+        """Returns a set of uid of all pods that finished according to the database"""
+        results = self.cursor.execute(
+            """SELECT uid FROM pods WHERE end_time is NOT NULL"""
+        )
+        return {result[0] for result in results}
+
     def get_running_pods(self):
         """Returns a set of uid of all running pods according to the database"""
         results = self.cursor.execute(

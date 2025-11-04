@@ -3,6 +3,7 @@ from datetime import timezone
 from .config import (
     STREAM_TIMEOUT,
     TERMINAL_PHASES,
+    STARTING_PHASES,
     IGNORED_NAMESPACES,
     IGNORED_NAMESPACE_PREFIXES,
 )
@@ -65,14 +66,6 @@ def get_pod_finished_time(pod):
     return None
 
 
-def backfill_terminated_pods(api, pod_database, logger):
-    """Find pods that have finished running but the pod object
-    still exists in the cluster.
-    This may be useful in the scenario where a pod starts and finishes
-    while our watcher script was down.
-    """
-
-
 def mark_deleted_running_pods(api, pod_database, logger):
     """
     To address the scenario where the script starts tracking a pod, and then
@@ -93,6 +86,9 @@ def watch_loop(api, pod_database, logger):
 
     seen_running = pod_database.get_running_pods()
     logger.info(f"Loading running pods from database. Number of running_pods: {len(seen_running)}")
+    finished_pods = pod_database.get_finished_pods()
+    logger.info(f"Loading finished pods from database. Number of finished_pods: {len(finished_pods)}")
+
     w = watch.Watch()
     logger.info("Starting pod event stream...")
 
@@ -116,12 +112,46 @@ def watch_loop(api, pod_database, logger):
             start = getattr(pod.status, "start_time", None)  # type: ignore
             start_iso = start.astimezone(timezone.utc).isoformat() if start else None
 
-            # Start billing when running
-            if (
-                # When the script starts, all pods that are already running show up as "ADDED" all at once
+            if etype in ("ADDED") and phase in TERMINAL_PHASES and uid not in finished_pods:
+
+                if uid in seen_running:
+                    # This is a stale pod, it was added to the database when the script was
+                    # running but it finished when the the watcher was down. So we just update it's
+                    # endtime
+                    logger.info(f"Updating stale pod {ns}/{name} that finished while watcher was down.")
+                    end_time = get_pod_finished_time(pod)
+                    guessed = False
+                    if not end_time:
+                        end_time = now_utc_iso()
+                        guessed = True
+                    pod_database.update_pod_end_time(
+                        uid, end_time, guessed
+                    )
+                    seen_running.discard(uid)
+                else:
+                    # True backfill, the pod started and finished when the watcher was down
+                    pod_database.insert_new_pod(
+                        uid, ns, name, node, cpu, mem, gpu, start_iso
+                    )
+                    end_time = get_pod_finished_time(pod)
+                    guessed = False
+                    pod_database.update_pod_end_time(
+                        uid, end_time, guessed
+                    )
+                    logger.info(f"Backfilled pod {ns}/{name}")
+
+                finished_pods.add(uid)
+
+            # Start billing when running. Instead of relying only no the pahse, we check
+            # by seeing if a node is assigned and start_time has been set. That is because
+            # when init contaners are running the pod status is actually Pending but it is
+            # holding the effective resources
+            elif (
                 etype in ("ADDED", "MODIFIED")
-                and phase == "Running"
+                and start is not None
+                and node is not None
                 and uid not in seen_running
+                and phase in STARTING_PHASES
             ):
                 pod_database.insert_new_pod(
                     uid, ns, name, node, cpu, mem, gpu, start_iso
@@ -143,14 +173,16 @@ def watch_loop(api, pod_database, logger):
                     uid, end_time, guessed
                 )
                 seen_running.discard(uid)
+                finished_pods.add(uid)
                 logger.info(f"Recorded end_time for {ns}/{name}")
 
             # If pod is deleted while still running
             elif etype == "DELETED" and uid in seen_running:
                 end_time = now_utc_iso()
-                guessed = False
+                guessed = True
                 pod_database.update_pod_end_time(
                     uid, end_time, guessed
                 )
                 seen_running.discard(uid)
+                finished_pods.add(uid)
                 logger.info(f"Deleted pod {ns}/{name}")

@@ -14,3 +14,4 @@ IGNORED_NAMESPACES = {
 }
 IGNORED_NAMESPACE_PREFIXES = ("openshift-", "kube-")
 TERMINAL_PHASES = {"Succeeded", "Failed"}
+STARTING_PHASES = {"Pending", "Running"}
