@@ -47,11 +47,21 @@ def effective_pod_requests(pod):
 
 def get_pod_finished_time(pod):
     """Return finished_at timestamp if available."""
-    if pod.status and pod.status.container_statuses:
-        for cs in pod.status.container_statuses:
-            term = getattr(cs.state, "terminated", None)
-            if term and term.finished_at:
-                return term.finished_at.astimezone(timezone.utc).isoformat()
+    if not (pod.status and pod.status.phase in TERMINAL_PHASES):
+        return None
+
+    if not pod.status.container_statuses:
+        return None
+
+    all_finish_times = []
+    for cs in pod.status.container_statuses:
+        term = getattr(cs.state, "terminated", None)
+        if term and term.finished_at:
+            all_finish_times.append(term.finished_at.astimezone(timezone.utc))
+
+    if all_finish_times:
+        return max(all_finish_times).isoformat()
+
     return None
 
 
