@@ -66,7 +66,7 @@ def get_pod_finished_time(pod):
     return None
 
 
-def mark_deleted_running_pods(api, pod_database, logger):
+def startup_reconciliation(api, pod_database, logger):
     """
     To address the scenario where the script starts tracking a pod, and then
     the script dies for some reason and the pod finishes and the object is deleted.
@@ -79,15 +79,73 @@ def mark_deleted_running_pods(api, pod_database, logger):
     This will require running this function in another thread and maybe thread safe way of handling
     access to DB.
     """
+    logger.info("Start reconciliation")
+    all_pods_list = api.list_pod_for_all_namespaces(watch=False)
+    cluster_pods_map = {pod.metadata.uid: pod for pod in all_pods_list.items}
+    cluster_pods_uids = set(cluster_pods_map.keys())
+    seen_running = pod_database.get_running_pods()
+    finished_pods = pod_database.get_finished_pods()
+    zombie_pod_uids = seen_running - cluster_pods_uids
+
+    if zombie_pod_uids:
+        logger.warning(f"Found {len(zombie_pod_uids)} zombie pods - deleted when the watcher was down")
+        end_time = now_utc_iso()
+        guessed = True
+        for uid in zombie_pod_uids:
+            logger.info(f"Setting end time for zombie pods")
+            pod_database.update_pod_end_time(uid, end_time, guessed)
+            seen_running.discard(uid)
+            finished_pods.add(uid)
+    else:
+        logger.info("No zombie pods found!")
+
+    logger.info("Starting backfill checks")
+    for uid, pod in cluster_pods_map.items():
+        ns = pod.metadata.namespace  # type: ignore
+        if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
+            continue
+        name = pod.metadata.name  # type: ignore
+        uid = pod.metadata.uid  # type: ignore
+        phase = getattr(pod.status, "phase", None)  # type: ignore
+        node = getattr(pod.spec, "node_name", None)  # type: ignore
+        phase = getattr(pod.status, "phase", None)
+        cpu, mem, gpu = effective_pod_requests(pod)
+        start = getattr(pod.status, "start_time", None)  # type: ignore
+        start_iso = start.astimezone(timezone.utc).isoformat() if start else None
+
+        if phase in TERMINAL_PHASES and uid not in finished_pods:
+            if uid in seen_running:
+                # This is a stale pod, it was added to the database when the script was
+                # running but it finished when the the watcher was down. So we just update it's
+                # endtime
+                logger.info(f"Updating stale pod {ns}/{name} that finished while watcher was down.")
+                end_time = get_pod_finished_time(pod)
+                guessed = False
+                if not end_time:
+                    end_time = now_utc_iso()
+                    guessed = True
+                pod_database.update_pod_end_time(
+                    uid, end_time, guessed
+                )
+                seen_running.discard(uid)
+            else:
+                # True backfill, the pod started and finished when the watcher was down
+                pod_database.insert_new_pod(
+                    uid, ns, name, node, cpu, mem, gpu, start_iso
+                )
+                end_time = get_pod_finished_time(pod)
+                guessed = False
+                pod_database.update_pod_end_time(
+                    uid, end_time, guessed
+                )
+                logger.info(f"Backfilled pod {ns}/{name}")
+            finished_pods.add(uid)
+    return seen_running, finished_pods
 
 
 def watch_loop(api, pod_database, logger):
     """Main event watcher loop."""
-
-    seen_running = pod_database.get_running_pods()
-    logger.info(f"Loading running pods from database. Number of running_pods: {len(seen_running)}")
-    finished_pods = pod_database.get_finished_pods()
-    logger.info(f"Loading finished pods from database. Number of finished_pods: {len(finished_pods)}")
+    seen_running, finished_pods = startup_reconciliation(api, pod_database, logger)
 
     w = watch.Watch()
     logger.info("Starting pod event stream...")
@@ -112,41 +170,11 @@ def watch_loop(api, pod_database, logger):
             start = getattr(pod.status, "start_time", None)  # type: ignore
             start_iso = start.astimezone(timezone.utc).isoformat() if start else None
 
-            if etype in ("ADDED") and phase in TERMINAL_PHASES and uid not in finished_pods:
-
-                if uid in seen_running:
-                    # This is a stale pod, it was added to the database when the script was
-                    # running but it finished when the the watcher was down. So we just update it's
-                    # endtime
-                    logger.info(f"Updating stale pod {ns}/{name} that finished while watcher was down.")
-                    end_time = get_pod_finished_time(pod)
-                    guessed = False
-                    if not end_time:
-                        end_time = now_utc_iso()
-                        guessed = True
-                    pod_database.update_pod_end_time(
-                        uid, end_time, guessed
-                    )
-                    seen_running.discard(uid)
-                else:
-                    # True backfill, the pod started and finished when the watcher was down
-                    pod_database.insert_new_pod(
-                        uid, ns, name, node, cpu, mem, gpu, start_iso
-                    )
-                    end_time = get_pod_finished_time(pod)
-                    guessed = False
-                    pod_database.update_pod_end_time(
-                        uid, end_time, guessed
-                    )
-                    logger.info(f"Backfilled pod {ns}/{name}")
-
-                finished_pods.add(uid)
-
             # Start billing when running. Instead of relying only no the pahse, we check
             # by seeing if a node is assigned and start_time has been set. That is because
             # when init contaners are running the pod status is actually Pending but it is
             # holding the effective resources
-            elif (
+            if (
                 etype in ("ADDED", "MODIFIED")
                 and start is not None
                 and node is not None
