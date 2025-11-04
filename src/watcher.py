@@ -9,17 +9,40 @@ from .config import (
 from .utils import parse_openshift_resource, now_utc_iso
 
 
-def sum_pod_requests(pod):
-    cpu = mem = gpu = 0
-    if not pod.spec or not pod.spec.containers:
-        return 0, 0, 0
-    for container in pod.spec.containers:
-        res = container.resources.requests or {}
-        cpu += parse_openshift_resource(res.get("cpu", "0"))
-        mem += parse_openshift_resource(res.get("memory", "0"))
-        gpu += float(res.get("nvidia.com/gpu", 0))
+def effective_pod_requests(pod):
+    """
+    This function calculates the effective pod requests that the kubernetes scheduler
+    uses when scheduling a pod[1]
 
-    return cpu, mem, gpu
+    It first finds the biggest resources requested by an init container, and then sum of
+    all the main containers resources. Finally, the max of either of those is what's
+    allocated on a node.
+
+    [1] https://kubernetes.io/docs/concepts/workloads/pods/init-containers/#resource-sharing-within-containers
+    """
+    if not pod.spec:
+        return 0, 0, 0
+
+    init_container_cpu = 0
+    init_container_memory = 0
+    init_container_gpu = 0
+    cpu = memory = gpu = 0
+
+    if pod.spec.init_containers:
+        for init_container in pod.spec.init_containers:
+            resources = init_container.resources.requests or {}
+            init_container_cpu = max(init_container_cpu, parse_openshift_resource(resources.get('cpu', 0)))
+            init_container_memory = max(init_container_memory, parse_openshift_resource(resources.get('memory', 0)))
+            init_container_gpu = max(init_container_gpu, parse_openshift_resource(resources.get('nvidia.com/gpu', 0)))
+
+    if pod.spec.containers:
+        for container in pod.spec.containers:
+            res = container.resources.requests or {}
+            cpu += parse_openshift_resource(res.get("cpu", "0"))
+            memory += parse_openshift_resource(res.get("memory", "0"))
+            gpu += int(res.get("nvidia.com/gpu", 0))
+
+    return max(cpu, init_container_cpu), max(memory, init_container_memory), max(gpu, init_container_gpu)
 
 
 def get_pod_finished_time(pod):
@@ -78,7 +101,8 @@ def watch_loop(api, pod_database, logger):
             if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
                 continue
 
-            cpu, mem, gpu = sum_pod_requests(pod)
+            cpu, mem, gpu = effective_pod_requests(pod)
+
             start = getattr(pod.status, "start_time", None)  # type: ignore
             start_iso = start.astimezone(timezone.utc).isoformat() if start else None
 

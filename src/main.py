@@ -9,7 +9,6 @@ def main():
     logger = get_logger()
     api = get_corev1_api()
     pod_database = PodDatabase(str(DB_PATH))
-    import ipdb; ipdb.set_trace()
 
     logger.info("Starting application!")
     try:
