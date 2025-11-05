@@ -6,6 +6,8 @@ metadata:
     app: pod-watcher
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: pod-watcher
@@ -19,6 +21,13 @@ spec:
         - name: pod-watcher
           image: ghcr.io/naved001/openshift-pod-watcher:sha-6a149b6
           imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
           env:
             - name: DB_PATH
               value: "/data/pods.db"
