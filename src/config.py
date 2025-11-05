@@ -1,4 +1,5 @@
-DB_PATH = "pods.db"
+import os
+DB_PATH = os.environ.get("DB_PATH", "pods.db")
 STREAM_TIMEOUT = 30
 IGNORED_NAMESPACES = {
     "openshift",
