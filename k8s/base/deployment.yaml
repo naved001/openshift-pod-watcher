@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-watcher-deployment
+  labels:
+    app: pod-watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-watcher
+  template:
+    metadata:
+      labels:
+        app: pod-watcher
+    spec:
+      serviceAccountName: pod-watcher-sa
+      containers:
+        - name: pod-watcher
+          image: ghcr.io/naved001/openshift-pod-watcher:sha-6a149b6
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_PATH
+              value: "/data/pods.db"
+          volumeMounts:
+            - name: pod-watcher-storage
+              mountPath: "/data"
+      volumes:
+        - name: pod-watcher-storage
+          persistentVolumeClaim:
+            claimName: pod-watcher-pvc
