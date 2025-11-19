@@ -51,11 +51,14 @@ def get_pod_finished_time(pod):
     if not (pod.status and pod.status.phase in TERMINAL_PHASES):
         return None
 
-    if not pod.status.container_statuses:
+    all_statuses = (pod.status.container_statuses or []) + \
+                    (pod.status.init_container_statuses or [])
+
+    if not all_statuses:
         return None
 
     all_finish_times = []
-    for cs in pod.status.container_statuses:
+    for cs in all_statuses:
         term = getattr(cs.state, "terminated", None)
         if term and term.finished_at:
             all_finish_times.append(term.finished_at.astimezone(timezone.utc))
@@ -202,7 +205,7 @@ def watch_loop(api, pod_database, logger):
                 )
                 seen_running.discard(uid)
                 finished_pods.add(uid)
-                logger.info(f"Recorded end_time for {ns}/{name}")
+                logger.info(f"Recorded end_time for {ns}/{name} guessed={guessed} end_time={end_time}")
 
             # If pod is deleted while still running
             elif etype == "DELETED" and uid in seen_running:
