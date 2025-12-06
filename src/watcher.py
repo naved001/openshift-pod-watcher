@@ -84,7 +84,10 @@ def startup_reconciliation(api, pod_database, logger):
     access to DB.
     """
     logger.info("Start reconciliation")
-    all_pods_list = api.list_pod_for_all_namespaces(watch=False)
+    # get all pods but not from cache. This is slow, but more reliable.
+    all_pods_list = api.list_pod_for_all_namespaces(watch=False, resource_version="")
+    initial_resource_version = all_pods_list.metadata.resource_version
+    logger.info(f"Resource version at startup: {initial_resource_version}")
     cluster_pods_map = {pod.metadata.uid: pod for pod in all_pods_list.items}
     cluster_pods_uids = set(cluster_pods_map.keys())
     seen_running = pod_database.get_running_pods()
@@ -144,15 +147,14 @@ def startup_reconciliation(api, pod_database, logger):
                 )
                 logger.info(f"Backfilled pod {ns}/{name}")
             finished_pods.add(uid)
-    return seen_running, finished_pods
+    return seen_running, finished_pods, initial_resource_version
 
 
 def watch_loop(api, pod_database, logger):
     """Main event watcher loop."""
-    seen_running, finished_pods = startup_reconciliation(api, pod_database, logger)
+    seen_running, finished_pods, resource_version = startup_reconciliation(api, pod_database, logger)
 
-    logger.info("Starting pod event stream...")
-    resource_version = ""
+    logger.info(f"Starting pod event stream with resource_verison={resource_version}")
 
     while True:
         w = watch.Watch()
@@ -224,7 +226,11 @@ def watch_loop(api, pod_database, logger):
                     logger.info(f"Deleted pod {ns}/{name}")
         except ApiException as e:
             logger.error(f"Kubernetes API exception: {e}")
-            continue
+            if e.status in (410, 504):
+                logger.info("Re-establishing watch due to resource version issue.")
+                resource_version = ""
+                continue
+            raise
         except Exception as e:
             logger.exception(f"Unexpected error in watch loop: {e}")
             resource_version = ""
