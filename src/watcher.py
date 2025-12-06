@@ -1,4 +1,5 @@
 from kubernetes import watch
+from kubernetes.client.exceptions import ApiException
 from datetime import timezone
 from .config import (
     STREAM_TIMEOUT,
@@ -150,70 +151,81 @@ def watch_loop(api, pod_database, logger):
     """Main event watcher loop."""
     seen_running, finished_pods = startup_reconciliation(api, pod_database, logger)
 
-    w = watch.Watch()
     logger.info("Starting pod event stream...")
+    resource_version = ""
 
     while True:
-        for event in w.stream(
-            api.list_pod_for_all_namespaces, timeout_seconds=STREAM_TIMEOUT
-        ):
-            pod = event["object"]  # type: ignore
-            ns = pod.metadata.namespace  # type: ignore
-            name = pod.metadata.name  # type: ignore
-            uid = pod.metadata.uid  # type: ignore
-            phase = getattr(pod.status, "phase", None)  # type: ignore
-            node = getattr(pod.spec, "node_name", None)  # type: ignore
-            etype = event["type"]  # type: ignore
-
-            if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
-                continue
-
-            cpu, mem, gpu = effective_pod_requests(pod)
-
-            start = getattr(pod.status, "start_time", None)  # type: ignore
-            start_iso = start.astimezone(timezone.utc).isoformat() if start else None
-
-            # Start billing when running. Instead of relying only no the pahse, we check
-            # by seeing if a node is assigned and start_time has been set. That is because
-            # when init contaners are running the pod status is actually Pending but it is
-            # holding the effective resources
-            if (
-                etype in ("ADDED", "MODIFIED")
-                and start is not None
-                and node is not None
-                and uid not in seen_running
-                and phase in STARTING_PHASES
+        w = watch.Watch()
+        try:
+            for event in w.stream(
+                api.list_pod_for_all_namespaces,
+                timeout_seconds=STREAM_TIMEOUT,
+                resource_version=resource_version
             ):
-                pod_database.insert_new_pod(
-                    uid, ns, name, node, cpu, mem, gpu, start_iso
-                )
-                seen_running.add(uid)
-                logger.info(f"Started billing pod {ns}/{name}")
+                pod = event["object"]  # type: ignore
+                ns = pod.metadata.namespace  # type: ignore
+                name = pod.metadata.name  # type: ignore
+                uid = pod.metadata.uid  # type: ignore
+                phase = getattr(pod.status, "phase", None)  # type: ignore
+                node = getattr(pod.spec, "node_name", None)  # type: ignore
+                etype = event["type"]  # type: ignore
+                resource_version = pod.metadata.resource_version  # type: ignore
+                if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
+                    continue
 
-            # Stop billing when pod finishes
-            elif (
-                etype == "MODIFIED" and uid in seen_running and phase in TERMINAL_PHASES
-            ):
-                end_time = get_pod_finished_time(pod)
-                guessed = False
-                if not end_time:
+                cpu, mem, gpu = effective_pod_requests(pod)
+
+                start = getattr(pod.status, "start_time", None)  # type: ignore
+                start_iso = start.astimezone(timezone.utc).isoformat() if start else None
+
+                # Start billing when running. Instead of relying only no the pahse, we check
+                # by seeing if a node is assigned and start_time has been set. That is because
+                # when init contaners are running the pod status is actually Pending but it is
+                # holding the effective resources
+                if (
+                    etype in ("ADDED", "MODIFIED")
+                    and start is not None
+                    and node is not None
+                    and uid not in seen_running
+                    and phase in STARTING_PHASES
+                ):
+                    pod_database.insert_new_pod(
+                        uid, ns, name, node, cpu, mem, gpu, start_iso
+                    )
+                    seen_running.add(uid)
+                    logger.info(f"Started billing pod {ns}/{name}")
+
+                # Stop billing when pod finishes
+                elif (
+                    etype == "MODIFIED" and uid in seen_running and phase in TERMINAL_PHASES
+                ):
+                    end_time = get_pod_finished_time(pod)
+                    guessed = False
+                    if not end_time:
+                        end_time = now_utc_iso()
+                        guessed = True
+
+                    pod_database.update_pod_end_time(
+                        uid, end_time, guessed
+                    )
+                    seen_running.discard(uid)
+                    finished_pods.add(uid)
+                    logger.info(f"Recorded end_time for {ns}/{name} guessed={guessed} end_time={end_time}")
+
+                # If pod is deleted while still running
+                elif etype == "DELETED" and uid in seen_running:
                     end_time = now_utc_iso()
                     guessed = True
-
-                pod_database.update_pod_end_time(
-                    uid, end_time, guessed
-                )
-                seen_running.discard(uid)
-                finished_pods.add(uid)
-                logger.info(f"Recorded end_time for {ns}/{name} guessed={guessed} end_time={end_time}")
-
-            # If pod is deleted while still running
-            elif etype == "DELETED" and uid in seen_running:
-                end_time = now_utc_iso()
-                guessed = True
-                pod_database.update_pod_end_time(
-                    uid, end_time, guessed
-                )
-                seen_running.discard(uid)
-                finished_pods.add(uid)
-                logger.info(f"Deleted pod {ns}/{name}")
+                    pod_database.update_pod_end_time(
+                        uid, end_time, guessed
+                    )
+                    seen_running.discard(uid)
+                    finished_pods.add(uid)
+                    logger.info(f"Deleted pod {ns}/{name}")
+        except ApiException as e:
+            logger.error(f"Kubernetes API exception: {e}")
+            continue
+        except Exception as e:
+            logger.exception(f"Unexpected error in watch loop: {e}")
+            resource_version = ""
+            continue
