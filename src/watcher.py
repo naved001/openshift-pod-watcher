@@ -86,8 +86,6 @@ def startup_reconciliation(api, pod_database, logger):
     logger.info("Start reconciliation")
     # get all pods but not from cache. This is slow, but more reliable.
     all_pods_list = api.list_pod_for_all_namespaces(watch=False, resource_version="")
-    initial_resource_version = all_pods_list.metadata.resource_version
-    logger.info(f"Resource version at startup: {initial_resource_version}")
     cluster_pods_map = {pod.metadata.uid: pod for pod in all_pods_list.items}
     cluster_pods_uids = set(cluster_pods_map.keys())
     seen_running = pod_database.get_running_pods()
@@ -147,15 +145,13 @@ def startup_reconciliation(api, pod_database, logger):
                 )
                 logger.info(f"Backfilled pod {ns}/{name}")
             finished_pods.add(uid)
-    return seen_running, finished_pods, initial_resource_version
+    return seen_running, finished_pods
 
 
 def watch_loop(api, pod_database, logger):
     """Main event watcher loop."""
-    seen_running, finished_pods, resource_version = startup_reconciliation(api, pod_database, logger)
-
-    logger.info(f"Starting pod event stream with resource_verison={resource_version}")
-
+    seen_running, finished_pods = startup_reconciliation(api, pod_database, logger)
+    resource_version = ""
     while True:
         w = watch.Watch()
         try:
