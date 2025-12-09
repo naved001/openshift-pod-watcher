@@ -86,18 +86,30 @@ def startup_reconciliation(api, pod_database, logger):
     logger.info("Start reconciliation")
     # get all pods but not from cache. This is slow, but more reliable.
     all_pods_list = api.list_pod_for_all_namespaces(watch=False, resource_version="")
+    initial_resource_version = all_pods_list.metadata.resource_version
+    logger.info(f"Resource version at startup: {initial_resource_version}")
     cluster_pods_map = {pod.metadata.uid: pod for pod in all_pods_list.items}
     cluster_pods_uids = set(cluster_pods_map.keys())
     seen_running = pod_database.get_running_pods()
     finished_pods = pod_database.get_finished_pods()
     zombie_pod_uids = seen_running - cluster_pods_uids
+    guessed_end_time = now_utc_iso()
 
     if zombie_pod_uids:
         logger.warning(f"Found {len(zombie_pod_uids)} zombie pods - deleted when the watcher was down")
-        end_time = now_utc_iso()
+        end_time = guessed_end_time
         guessed = True
         for uid in zombie_pod_uids:
-            logger.info(f"Setting end time for zombie pods")
+            pod_metadata = pod_database.get_pod_metadata(uid)
+            if pod_metadata is None:
+                logger.error(f"Could not find metadata for zombie pod uid {uid}, skipping")
+                continue
+            if pod_metadata['end_time'] is not None:
+                logger.error(f"Pod {uid} {pod_metadata['namespace']}/{pod_metadata['name']} already has end_time set, it should not be a zombie, skipping")
+                seen_running.discard(uid)
+                finished_pods.add(uid)
+                continue
+            logger.info(f"Setting end time for zombie pod {uid} {pod_metadata['namespace']}/{pod_metadata['name']} started at {pod_metadata['start_time']}")
             pod_database.update_pod_end_time(uid, end_time, guessed)
             seen_running.discard(uid)
             finished_pods.add(uid)
@@ -127,7 +139,7 @@ def startup_reconciliation(api, pod_database, logger):
                 end_time = get_pod_finished_time(pod)
                 guessed = False
                 if not end_time:
-                    end_time = now_utc_iso()
+                    end_time = guessed_end_time
                     guessed = True
                 pod_database.update_pod_end_time(
                     uid, end_time, guessed
@@ -135,23 +147,32 @@ def startup_reconciliation(api, pod_database, logger):
                 seen_running.discard(uid)
             else:
                 # True backfill, the pod started and finished when the watcher was down
+                if start_iso is None:
+                    logger.error(f"Pod {ns}/{name} has no start time, cannot backfill")
+                    continue
+
                 pod_database.insert_new_pod(
                     uid, ns, name, node, cpu, mem, gpu, start_iso
                 )
-                end_time = get_pod_finished_time(pod)
                 guessed = False
+                end_time = get_pod_finished_time(pod)
+                if not end_time:
+                    guessed = True
+                    end_time = guessed_end_time
+                    # TODO:  we should probably set it to a a minute or so after start, to avoid overcharging
                 pod_database.update_pod_end_time(
                     uid, end_time, guessed
-                )
-                logger.info(f"Backfilled pod {ns}/{name}")
+                ) # TODO: This should be a single insert statement
+                logger.info(f"Backfilled pod {ns}/{name} end_time={end_time} guessed={guessed}")
             finished_pods.add(uid)
-    return seen_running, finished_pods
+    return seen_running, finished_pods, initial_resource_version
 
 
 def watch_loop(api, pod_database, logger):
     """Main event watcher loop."""
-    seen_running, finished_pods = startup_reconciliation(api, pod_database, logger)
-    resource_version = ""
+    seen_running, finished_pods, resource_version = startup_reconciliation(api, pod_database, logger)
+    logger.info("Starting watch loop")
+
     while True:
         w = watch.Watch()
         try:
@@ -167,7 +188,7 @@ def watch_loop(api, pod_database, logger):
                 phase = getattr(pod.status, "phase", None)  # type: ignore
                 node = getattr(pod.spec, "node_name", None)  # type: ignore
                 etype = event["type"]  # type: ignore
-                resource_version = pod.metadata.resource_version  # type: ignore
+
                 if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
                     continue
 
@@ -220,6 +241,8 @@ def watch_loop(api, pod_database, logger):
                     seen_running.discard(uid)
                     finished_pods.add(uid)
                     logger.info(f"Deleted pod {ns}/{name}")
+                else:
+                    logger.debug(f"Ignored event {etype} for pod {ns}/{name} in phase {phase}")
         except ApiException as e:
             logger.error(f"Kubernetes API exception: {e}")
             if e.status in (410, 504):

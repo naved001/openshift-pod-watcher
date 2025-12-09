@@ -64,5 +64,22 @@ class PodDatabase:
         )
         return {result[0] for result in results}
 
+    def get_pod_metadata(self, uid):
+        """Returns metadata for a pod given its uid."""
+        result = self.cursor.execute(
+            """SELECT namespace, name, start_time, end_time, end_time_guessed
+               FROM pods WHERE uid = ?""",
+            (uid,),
+        ).fetchone()
+        if result:
+            return {
+                "namespace": result[0],
+                "name": result[1],
+                "start_time": result[2],
+                "end_time": result[3],
+                "end_time_guessed": bool(result[4]),
+            }
+        return None
+
     def close(self):
         self.connection.close()
