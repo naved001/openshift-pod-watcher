@@ -150,7 +150,6 @@ def startup_reconciliation(api, pod_database, logger):
                 if start_iso is None:
                     logger.error(f"Pod {ns}/{name} has no start time, cannot backfill")
                     continue
-
                 pod_database.insert_new_pod(
                     uid, ns, name, node, cpu, mem, gpu, start_iso
                 )
@@ -165,6 +164,12 @@ def startup_reconciliation(api, pod_database, logger):
                 ) # TODO: This should be a single insert statement
                 logger.info(f"Backfilled pod {ns}/{name} end_time={end_time} guessed={guessed}")
             finished_pods.add(uid)
+        elif phase in STARTING_PHASES and uid not in seen_running and start is not None and node is not None:
+            logger.info(f"Found new running pod {ns}/{name} that started. Inserting record.")
+            pod_database.insert_new_pod(
+                    uid, ns, name, node, cpu, mem, gpu, start_iso
+                )
+            seen_running.add(uid)
     return seen_running, finished_pods, initial_resource_version
 
 
@@ -188,7 +193,8 @@ def watch_loop(api, pod_database, logger):
                 phase = getattr(pod.status, "phase", None)  # type: ignore
                 node = getattr(pod.spec, "node_name", None)  # type: ignore
                 etype = event["type"]  # type: ignore
-
+                resource_version = pod.metadata.resource_version  # type: ignore
+                is_terminating = pod.metadata.deletion_timestamp is not None  # type: ignore
                 if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
                     continue
 
@@ -203,10 +209,11 @@ def watch_loop(api, pod_database, logger):
                 # holding the effective resources
                 if (
                     etype in ("ADDED", "MODIFIED")
-                    and start is not None
+                    and start is not None # Pods that are pending don't have a start time
                     and node is not None
                     and uid not in seen_running
                     and phase in STARTING_PHASES
+                    and not is_terminating
                 ):
                     pod_database.insert_new_pod(
                         uid, ns, name, node, cpu, mem, gpu, start_iso
@@ -247,10 +254,10 @@ def watch_loop(api, pod_database, logger):
             logger.error(f"Kubernetes API exception: {e}")
             if e.status in (410, 504):
                 logger.info("Re-establishing watch due to resource version issue.")
-                resource_version = ""
+                seen_running, finished_pods, resource_version = startup_reconciliation(api, pod_database, logger)
                 continue
             raise
         except Exception as e:
             logger.exception(f"Unexpected error in watch loop: {e}")
-            resource_version = ""
+            seen_running, finished_pods, resource_version = startup_reconciliation(api, pod_database, logger)
             continue
