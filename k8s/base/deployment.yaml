@@ -19,8 +19,9 @@ spec:
       serviceAccountName: pod-watcher-sa
       containers:
         - name: pod-watcher
-          image: ghcr.io/naved001/openshift-pod-watcher:sha-6a149b6
+          image: ghcr.io/naved001/openshift-pod-watcher:main
           imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "src.main"]
           resources:
             requests:
               memory: "512Mi"
