@@ -1,6 +1,6 @@
 import os
 DB_PATH = os.environ.get("DB_PATH", "pods.db")
-STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", 120))
+STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", 240))  # in seconds
 IGNORED_NAMESPACES = {
     "openshift",
     "kube-system",

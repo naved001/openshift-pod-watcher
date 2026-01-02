@@ -1,5 +1,6 @@
 from kubernetes import watch
 from kubernetes.client.exceptions import ApiException
+from urllib3.exceptions import ReadTimeoutError
 from datetime import timezone
 from .config import (
     STREAM_TIMEOUT,
@@ -183,7 +184,8 @@ def watch_loop(api, pod_database, logger):
         try:
             for event in w.stream(
                 api.list_pod_for_all_namespaces,
-                timeout_seconds=STREAM_TIMEOUT,
+                timeout_seconds=STREAM_TIMEOUT, # server side timeout
+                _request_timeout=STREAM_TIMEOUT + 5, # client side timeout
                 resource_version=resource_version
             ):
                 pod = event["object"]  # type: ignore
@@ -257,6 +259,10 @@ def watch_loop(api, pod_database, logger):
                 seen_running, finished_pods, resource_version = startup_reconciliation(api, pod_database, logger)
                 continue
             raise
+        except ReadTimeoutError as e:
+            logger.warning(f"The server stopped responding, client reconnecting: {e}")
+            # Simply restart the watch loop from the last known resource version
+            continue
         except Exception as e:
             logger.exception(f"Unexpected error in watch loop: {e}")
             seen_running, finished_pods, resource_version = startup_reconciliation(api, pod_database, logger)
