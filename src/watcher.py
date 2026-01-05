@@ -180,6 +180,7 @@ def watch_loop(api, pod_database, logger):
     logger.info("Starting watch loop")
 
     while True:
+        logger.debug(f"Starting watch from resource_version {resource_version}")
         w = watch.Watch()
         try:
             for event in w.stream(
@@ -252,6 +253,7 @@ def watch_loop(api, pod_database, logger):
                     logger.info(f"Deleted pod {ns}/{name}")
                 else:
                     logger.debug(f"Ignored event {etype} for pod {ns}/{name} in phase {phase}")
+                logger.debug(f"End of for loop: ResourceVersion: {resource_version}")
         except ApiException as e:
             logger.error(f"Kubernetes API exception: {e}")
             if e.status in (410, 504):

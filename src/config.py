@@ -1,5 +1,7 @@
 import os
 DB_PATH = os.environ.get("DB_PATH", "pods.db")
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LIB_LOG_LEVEL = os.environ.get("LIB_LOG_LEVEL", "WARNING").upper()
 STREAM_TIMEOUT = int(os.environ.get("STREAM_TIMEOUT", 240))  # in seconds
 IGNORED_NAMESPACES = {
     "openshift",
