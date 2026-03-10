@@ -71,6 +71,37 @@ def get_pod_finished_time(pod):
     return None
 
 
+def extract_pod_info(pod):
+    """Extract commonly used metadata and resource info from a pod object."""
+    ns = pod.metadata.namespace
+    name = pod.metadata.name
+    uid = pod.metadata.uid
+    phase = getattr(pod.status, "phase", None)
+    node = getattr(pod.spec, "node_name", None)
+    cpu, mem, gpu = effective_pod_requests(pod)
+    start = getattr(pod.status, "start_time", None)
+    start_iso = start.astimezone(timezone.utc).isoformat() if start else None
+    return ns, name, uid, phase, node, cpu, mem, gpu, start, start_iso
+
+
+def record_pod_end_time(uid, pod, pod_database, seen_running, finished_pods, fallback_end_time=None):
+    """Record end time for a pod and update tracking sets.
+
+    Uses get_pod_finished_time(pod) first; if unavailable, falls back to
+    fallback_end_time if provided, otherwise now_utc_iso(), and marks as guessed.
+    Returns (end_time, guessed).
+    """
+    end_time = get_pod_finished_time(pod)
+    guessed = False
+    if not end_time:
+        end_time = fallback_end_time if fallback_end_time is not None else now_utc_iso()
+        guessed = True
+    pod_database.update_pod_end_time(uid, end_time, guessed)
+    seen_running.discard(uid)
+    finished_pods.add(uid)
+    return end_time, guessed
+
+
 def startup_reconciliation(api, pod_database, logger):
     """
     To address the scenario where the script starts tracking a pod, and then
@@ -118,18 +149,10 @@ def startup_reconciliation(api, pod_database, logger):
         logger.info("No zombie pods found!")
 
     logger.info("Starting backfill checks")
-    for uid, pod in cluster_pods_map.items():
-        ns = pod.metadata.namespace  # type: ignore
+    for _, pod in cluster_pods_map.items():
+        ns, name, uid, phase, node, cpu, mem, gpu, start, start_iso = extract_pod_info(pod)
         if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
             continue
-        name = pod.metadata.name  # type: ignore
-        uid = pod.metadata.uid  # type: ignore
-        phase = getattr(pod.status, "phase", None)  # type: ignore
-        node = getattr(pod.spec, "node_name", None)  # type: ignore
-        phase = getattr(pod.status, "phase", None)
-        cpu, mem, gpu = effective_pod_requests(pod)
-        start = getattr(pod.status, "start_time", None)  # type: ignore
-        start_iso = start.astimezone(timezone.utc).isoformat() if start else None
 
         if phase in TERMINAL_PHASES and uid not in finished_pods:
             if uid in seen_running:
@@ -137,15 +160,7 @@ def startup_reconciliation(api, pod_database, logger):
                 # running but it finished when the the watcher was down. So we just update it's
                 # endtime
                 logger.info(f"Updating stale pod {ns}/{name} that finished while watcher was down.")
-                end_time = get_pod_finished_time(pod)
-                guessed = False
-                if not end_time:
-                    end_time = guessed_end_time
-                    guessed = True
-                pod_database.update_pod_end_time(
-                    uid, end_time, guessed
-                )
-                seen_running.discard(uid)
+                record_pod_end_time(uid, pod, pod_database, seen_running, finished_pods, guessed_end_time)
             else:
                 # True backfill, the pod started and finished when the watcher was down
                 if start_iso is None:
@@ -154,17 +169,9 @@ def startup_reconciliation(api, pod_database, logger):
                 pod_database.insert_new_pod(
                     uid, ns, name, node, cpu, mem, gpu, start_iso
                 )
-                guessed = False
-                end_time = get_pod_finished_time(pod)
-                if not end_time:
-                    guessed = True
-                    end_time = guessed_end_time
-                    # TODO:  we should probably set it to a a minute or so after start, to avoid overcharging
-                pod_database.update_pod_end_time(
-                    uid, end_time, guessed
-                ) # TODO: This should be a single insert statement
+                end_time, guessed = record_pod_end_time(uid, pod, pod_database, seen_running, finished_pods, guessed_end_time)
+                # TODO: insert_new_pod and update_pod_end_time should be a single insert statement
                 logger.info(f"Backfilled pod {ns}/{name} end_time={end_time} guessed={guessed}")
-            finished_pods.add(uid)
         elif phase in STARTING_PHASES and uid not in seen_running and start is not None and node is not None:
             logger.info(f"Found new running pod {ns}/{name} that started. Inserting record.")
             pod_database.insert_new_pod(
@@ -190,25 +197,16 @@ def watch_loop(api, pod_database, logger):
                 resource_version=resource_version
             ):
                 pod = event["object"]  # type: ignore
-                ns = pod.metadata.namespace  # type: ignore
-                name = pod.metadata.name  # type: ignore
-                uid = pod.metadata.uid  # type: ignore
-                phase = getattr(pod.status, "phase", None)  # type: ignore
-                node = getattr(pod.spec, "node_name", None)  # type: ignore
+                ns, name, uid, phase, node, cpu, mem, gpu, start, start_iso = extract_pod_info(pod)
                 etype = event["type"]  # type: ignore
                 resource_version = pod.metadata.resource_version  # type: ignore
                 is_terminating = pod.metadata.deletion_timestamp is not None  # type: ignore
                 if ns in IGNORED_NAMESPACES or ns.startswith(IGNORED_NAMESPACE_PREFIXES):
                     continue
 
-                cpu, mem, gpu = effective_pod_requests(pod)
-
-                start = getattr(pod.status, "start_time", None)  # type: ignore
-                start_iso = start.astimezone(timezone.utc).isoformat() if start else None
-
-                # Start billing when running. Instead of relying only no the pahse, we check
+                # Start billing when running. Instead of relying only on the phase, we check
                 # by seeing if a node is assigned and start_time has been set. That is because
-                # when init contaners are running the pod status is actually Pending but it is
+                # when init containers are running the pod status is actually Pending but it is
                 # holding the effective resources
                 if (
                     etype in ("ADDED", "MODIFIED")
@@ -228,28 +226,12 @@ def watch_loop(api, pod_database, logger):
                 elif (
                     etype == "MODIFIED" and uid in seen_running and phase in TERMINAL_PHASES
                 ):
-                    end_time = get_pod_finished_time(pod)
-                    guessed = False
-                    if not end_time:
-                        end_time = now_utc_iso()
-                        guessed = True
-
-                    pod_database.update_pod_end_time(
-                        uid, end_time, guessed
-                    )
-                    seen_running.discard(uid)
-                    finished_pods.add(uid)
+                    end_time, guessed = record_pod_end_time(uid, pod, pod_database, seen_running, finished_pods)
                     logger.info(f"Recorded end_time for {ns}/{name} guessed={guessed} end_time={end_time}")
 
                 # If pod is deleted while still running
                 elif etype == "DELETED" and uid in seen_running:
-                    end_time = now_utc_iso()
-                    guessed = True
-                    pod_database.update_pod_end_time(
-                        uid, end_time, guessed
-                    )
-                    seen_running.discard(uid)
-                    finished_pods.add(uid)
+                    end_time, guessed = record_pod_end_time(uid, pod, pod_database, seen_running, finished_pods)
                     logger.info(f"Deleted pod {ns}/{name}")
                 else:
                     logger.debug(f"Ignored event {etype} for pod {ns}/{name} in phase {phase}")
